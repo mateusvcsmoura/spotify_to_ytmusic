@@ -6,6 +6,7 @@ import os
 import time
 import re
 
+import ytmusicapi
 from ytmusicapi import YTMusic
 from typing import Optional, Union, Iterator, Dict, List
 from collections import namedtuple
@@ -17,8 +18,19 @@ SongInfo = namedtuple("SongInfo", ["title", "artist", "album"])
 
 def get_ytmusic() -> YTMusic:
     """
-    @@@
+    Log in to YTMusic.  If YTMUSIC_COOKIE is set (.env), 'oauth.json' is (re)built from it.
     """
+    cookie = os.environ.get("YTMUSIC_COOKIE")
+    if cookie:
+        # ponytail: the "authorization" value is only a marker for browser auth;
+        # ytmusicapi recomputes the real SAPISIDHASH from the cookie on every request.
+        ytmusicapi.setup(
+            filepath="oauth.json",
+            headers_raw=f"cookie: {cookie}\n"
+            f"x-goog-authuser: {os.environ.get('YTMUSIC_AUTHUSER', '0')}\n"
+            "authorization: SAPISIDHASH",
+        )
+
     if not os.path.exists("oauth.json"):
         print("ERROR: No file 'oauth.json' exists in the current directory.")
         print("       Have you logged in to YTMusic?  Run 'ytmusicapi oauth' to login")
