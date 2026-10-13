@@ -269,6 +269,7 @@ def copy_playlist():
         track_sleep=args.track_sleep,
         dry_run=args.dry_run,
         spotify_playlists_encoding=args.spotify_playlists_encoding,
+        yt_search_algo=args.algo,
         reverse_playlist=not args.no_reverse_playlist,
         privacy_status=args.privacy,
     )
@@ -322,6 +323,7 @@ def copy_all_playlists():
         track_sleep=args.track_sleep,
         dry_run=args.dry_run,
         spotify_playlists_encoding=args.spotify_playlists_encoding,
+        yt_search_algo=args.algo,
         reverse_playlist=not args.no_reverse_playlist,
         privacy_status=args.privacy,
     )
