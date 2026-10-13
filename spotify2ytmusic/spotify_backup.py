@@ -3,17 +3,27 @@
 #  This file is licensed under the MIT license
 #  This file originates from https://github.com/caseychu/spotify-backup
 
+import base64
 import codecs
+import hashlib
 import http.client
 import http.server
 import json
-import re
+import os
+import secrets
+import ssl
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+
+import certifi
+
+# Windows only exposes root CAs it has already fetched; accounts.spotify.com chains to
+# Starfield G2, which is often missing there.  certifi ships with requests/ytmusicapi.
+_SSL = ssl.create_default_context(cafile=certifi.where())
 
 
 class SpotifyAPI:
@@ -48,9 +58,15 @@ class SpotifyAPI:
 
     @staticmethod
     def authorize(client_id, scope):
-        """Open a browser for user authorization and return SpotifyAPI instance."""
+        """Authorization Code + PKCE flow (Spotify removed the implicit grant in Nov 2025).
+
+        Opens a browser for user authorization and returns a SpotifyAPI instance.
+        """
         redirect_uri = f"http://127.0.0.1:{SpotifyAPI._SERVER_PORT}/redirect"
-        url = SpotifyAPI._construct_auth_url(client_id, scope, redirect_uri)
+        verifier = secrets.token_urlsafe(64)
+        url = SpotifyAPI._construct_auth_url(
+            client_id, scope, redirect_uri, SpotifyAPI._pkce_challenge(verifier)
+        )
         print(f"Open this link if the browser doesn't open automatically: {url}")
         webbrowser.open(url)
 
@@ -59,16 +75,40 @@ class SpotifyAPI:
             while True:
                 server.handle_request()
         except SpotifyAPI._Authorization as auth:
-            return SpotifyAPI(auth.access_token)
+            code = auth.code
+        finally:
+            server.server_close()
+
+        data = urllib.parse.urlencode(
+            {
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "client_id": client_id,
+                "code_verifier": verifier,
+            }
+        ).encode()
+        # ponytail: token lasts 1h with no refresh; a backup takes minutes.
+        with urllib.request.urlopen(
+            "https://accounts.spotify.com/api/token", data, context=_SSL
+        ) as res:
+            return SpotifyAPI(json.load(res)["access_token"])
 
     @staticmethod
-    def _construct_auth_url(client_id, scope, redirect_uri):
+    def _pkce_challenge(verifier):
+        digest = hashlib.sha256(verifier.encode("ascii")).digest()
+        return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+    @staticmethod
+    def _construct_auth_url(client_id, scope, redirect_uri, code_challenge):
         return "https://accounts.spotify.com/authorize?" + urllib.parse.urlencode(
             {
-                "response_type": "token",
+                "response_type": "code",
                 "client_id": client_id,
                 "scope": scope,
                 "redirect_uri": redirect_uri,
+                "code_challenge_method": "S256",
+                "code_challenge": code_challenge,
             }
         )
 
@@ -88,7 +128,7 @@ class SpotifyAPI:
 
     def _read_response(self, req):
         """Read and parse the response."""
-        with urllib.request.urlopen(req) as res:
+        with urllib.request.urlopen(req, context=_SSL) as res:
             reader = codecs.getreader("utf-8")
             return json.load(reader(res))
 
@@ -103,37 +143,38 @@ class SpotifyAPI:
 
     class _AuthorizationHandler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
-            if self.path.startswith("/redirect"):
-                self._redirect_to_token()
-            elif self.path.startswith("/token?"):
-                self._handle_token()
-            else:
+            if not self.path.startswith("/redirect"):
                 self.send_error(404)
-
-        def _redirect_to_token(self):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(
-                b'<script>location.replace("token?" + location.hash.slice(1));</script>'
-            )
-
-        def _handle_token(self):
+                return
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
             self.wfile.write(
                 b"<script>close()</script>Thanks! You may now close this window."
             )
-            access_token = re.search("access_token=([^&]*)", self.path).group(1)
-            raise SpotifyAPI._Authorization(access_token)
+            if "code" not in query:
+                sys.exit(
+                    f"Spotify authorization failed: {query.get('error', ['no code'])[0]}"
+                )
+            raise SpotifyAPI._Authorization(query["code"][0])
 
         def log_message(self, format, *args):
             pass
 
     class _Authorization(Exception):
-        def __init__(self, access_token):
-            self.access_token = access_token
+        def __init__(self, code):
+            self.code = code
+
+
+def _tracks(items):
+    """Normalize paging items to the {"track": {...}} shape backend.py reads.
+
+    The Feb 2026 API renamed playlist entries "track" -> "item".  Podcast episodes
+    and unavailable entries are dropped: they can't be matched on YTMusic.
+    """
+    tracks = [x.get("item") or x.get("track") for x in items]
+    return [{"track": t} for t in tracks if t and t.get("type") == "track"]
 
 
 def fetch_user_data(spotify, dump):
@@ -143,19 +184,24 @@ def fetch_user_data(spotify, dump):
 
     if "liked" in dump:
         print("Loading liked albums and songs...")
-        liked_tracks = spotify.list("me/tracks", {"limit": 50})
+        liked_tracks = _tracks(spotify.list("me/tracks", {"limit": 50}))
         liked_albums = spotify.list("me/albums", {"limit": 50})
         playlists.append({"name": "Liked Songs", "tracks": liked_tracks})
 
     if "playlists" in dump:
         print("Loading playlists...")
-        playlist_data = spotify.list("me/playlists", {"limit": 50})
-        for playlist in playlist_data:
+        my_id = spotify.get("me")["id"]
+        for playlist in spotify.list("me/playlists", {"limit": 50}):
+            # Since Feb 2026 Spotify only returns the contents of playlists you own
+            # or collaborate on; followed playlists come back without tracks.
+            if playlist["owner"]["id"] != my_id and not playlist.get("collaborative"):
+                print(f"Skipping (followed, not yours): {playlist['name']}")
+                continue
             print(f"Loading playlist: {playlist['name']}")
-            playlist["tracks"] = spotify.list(
-                playlist["tracks"]["href"], {"limit": 100}
+            playlist["tracks"] = _tracks(
+                spotify.list(f"playlists/{playlist['id']}/items", {"limit": 50})
             )
-        playlists.extend(playlist_data)
+            playlists.append(playlist)
 
     return playlists, liked_albums
 
@@ -190,11 +236,16 @@ def write_to_file(file, format, playlists, liked_albums):
 
 def main(dump="playlists,liked", format="json", file="playlists.json", token=""):
     print("Starting backup...")
+    client_id = os.environ.get("SPOTIFY_CLIENT_ID")
+    if not token and not client_id:
+        sys.exit(
+            "ERROR: SPOTIFY_CLIENT_ID is not set.  Fill it in the .env file (see the comments there)."
+        )
     spotify = (
         SpotifyAPI(token)
         if token
         else SpotifyAPI.authorize(
-            client_id="5c098bcc800e45d49e476265bc9b6934",
+            client_id=client_id,
             scope="playlist-read-private playlist-read-collaborative user-library-read",
         )
     )
